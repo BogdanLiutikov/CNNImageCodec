@@ -1,6 +1,15 @@
 keras==2.15.0
 matplotlib==3.8.4
 numpy==1.23.5
+Pillow==10.3.0
+pybind11==2.11.1
+setuptools==58.1.0
+tensorflow==2.15.0
+tensorflow_intel==2.15.0
+torch==2.3.0+cu121
+torchvision==0.18.0+cu121
+matplotlib==3.8.4
+numpy==1.23.5
 Pillow==9.5.0
 Pillow==10.3.0
 pybind11==2.11.1

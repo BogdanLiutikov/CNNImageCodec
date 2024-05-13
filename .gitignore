@@ -1,0 +1,12 @@
+__pycache__/
+venv/
+build/
+
+*.png
+*.jpg
+*.jpeg
+*.pth
+*.bin
+
+!doc/*.png
+!model/*.pth

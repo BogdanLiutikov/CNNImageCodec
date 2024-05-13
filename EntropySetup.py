@@ -5,7 +5,7 @@ import pybind11
 functions_module = Extension(
     name='EntropyCodec',
     sources=['wrapper.cpp'],
-    include_dirs=[os.path.join(os.getenv('PYTHON_DIR'), 'include'),
+    include_dirs=[os.path.join('venv/Scripts', 'include'),
                 os.path.join(pybind11.__path__[0], 'include')]
 )
 

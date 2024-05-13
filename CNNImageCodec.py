@@ -4,15 +4,21 @@
 #Written by Evgeny Belyaev, February 2024.
 import os
 import math
+import random
 import numpy
 from matplotlib import pyplot as plt
 from PIL import Image
 import imghdr
-import tensorflow
-from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras.models import Model
-from keras import backend as K
+
+import torch
+from torch import nn
+from torch import optim
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+
 
 #import C-implementation of Witten&Neal&Cleary-1987 arithmetic coding as a external module
 from EntropyCodec import *
@@ -27,11 +33,10 @@ h=128
 #If 0, then the training will be started, otherwise the model will be readed from a file
 LoadModel = 1
 #Training parameters
-batch_size = 10
+batch_size = 4
 #Number of bits for representation of the layers sample in the training process
-bt = 3
-epochs = 3000
-#epochs = 100
+bt = 2
+epochs = 100
 #Model parameters
 n1=128
 n2=32
@@ -41,7 +46,14 @@ n3=16
 NumImagesToShow = 5
 
 #Number of bits for representation of the layers sample
-b = 3
+b = 2
+
+lr=1e-3
+
+model_name = f'model_b2_epochs100'
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print('device =', device)
 
 #Compute PSNR in RGB domain
 def PSNR_RGB(image1,image2):
@@ -64,74 +76,135 @@ def PSNR_RGB(image1,image2):
 #Compute PSNR between two vectors
 def PSNR(y_true, y_pred):
     max_pixel = 1.0
-    return 10.0 * (1.0 / math.log(10)) * K.log((max_pixel ** 2) / (K.mean(K.square(y_pred - y_true))))
+    return (10.0 * (1.0 / math.log(10)) * torch.log((max_pixel ** 2) / (torch.mean(torch.square(torch.tensor(y_pred - y_true)))))).item()
 
-#reads all images from folder and puts them into x array
-def LoadImagesFromFolder (foldername):
-    dir_list = os.listdir(foldername)
-    N = 0
-    Nmax = 0
-    for name in dir_list:
-        fullname = foldername + name
-        filetype = imghdr.what(fullname)
-        if filetype is None:
-            print('')
-        else:
-            Nmax = Nmax + 1
+class CustomImageDataset(Dataset):
+    def __init__(self, foldername, transform=None):
+        self.foldername = foldername
+        self.transform = transform
+        self.image_files = self._load_image_files()
+        self.w = w
+        self.h = h
 
-    x = numpy.zeros([Nmax, w, h, 3])
-    N = 0
-    for name in dir_list:
-        fullname = foldername + name
-        filetype = imghdr.what(fullname)
-        if filetype is None:
-            print('Unknown image format for file: ', name)
-        else:
-            print('Progress: N = %i' % N)
-            image = Image.open(fullname)
-            I1 = numpy.array(image.getdata()).reshape(image.size[0], image.size[1], 3)
-            x[N, :, :, :] = I1
-            N = N + 1
-    return x
+    def __len__(self):
+        return len(self.image_files)
 
-#Model training function
+    def __getitem__(self, idx):
+        img_name = self.image_files[idx]
+        img_path = os.path.join(self.foldername, img_name)
+        image = Image.open(img_path)
+        if self.transform:
+            image = self.transform(image)
+        return image
+
+    def _load_image_files(self):
+        dir_list = os.listdir(self.foldername)
+        image_files = []
+        for name in dir_list:
+            fullname = os.path.join(self.foldername, name)
+            filetype = imghdr.what(fullname)
+            if filetype is not None:
+                image_files.append(name)
+        return image_files
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.gelu = nn.LeakyReLU()
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv2(self.gelu(self.conv1(x)))
+        out += residual
+        return out
+
+class Autoencoder(nn.Module):
+    def __init__(self):
+        super(Autoencoder, self).__init__()
+        
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, n1, kernel_size=3, padding=1, stride=2),
+            nn.LeakyReLU(),
+            ResidualBlock(n1),
+
+            nn.Conv2d(n1, n2, kernel_size=3, padding=1, stride=2),
+            nn.LeakyReLU(),
+            ResidualBlock(n2),
+
+            nn.Conv2d(n2, n3, kernel_size=3, padding=1, stride=2),
+            nn.LeakyReLU(),
+        )
+        
+        self.decoder = nn.Sequential(
+            ResidualBlock(n3),
+            nn.ConvTranspose2d(n3, n2, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.LeakyReLU(),
+
+            ResidualBlock(n2),
+            nn.ConvTranspose2d(n2, n1, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.LeakyReLU(),
+
+            ResidualBlock(n1),
+            nn.ConvTranspose2d(n1, 3, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.Sigmoid()
+        )
+        
+        self.bt = bt
+        self.w = w
+        self.h = h
+
+    def forward(self, x):
+        # Encoder
+        e3 = self.encoder(x)
+        # Adding noise during training
+        if self.training:
+            noise = torch.rand_like(e3) * (torch.max(e3) / (2 ** (self.bt + 1)))
+            e3 = e3 + noise
+
+        # Decoder
+        x = self.decoder(e3)
+        return x
+
 def ImageCodecModel(trainfolder):
-    input = layers.Input(shape=(w, h, 3))
-    # Encoder
-    e1 = layers.Conv2D(n1, (7, 7), activation="relu", padding="same")(input)
-    e1 = layers.MaxPooling2D((2, 2), padding="same")(e1)
-    e2 = layers.Conv2D(n2, (5, 5), activation="relu", padding="same")(e1)
-    e2 = layers.MaxPooling2D((2, 2), padding="same")(e2)
-    e3 = layers.Conv2D(n3, (3, 3), activation="relu", padding="same")(e2)
-    e3 = layers.MaxPooling2D((2, 2), padding="same")(e3)
-    #add noise during training (needed for layer quantinzation)
-    e3 = e3 + tensorflow.random.uniform(tensorflow.shape(e3), 0, tensorflow.math.reduce_max(e3)/pow(2, bt+1))
-
-    # Decoder
-    x = layers.Conv2DTranspose(n3, (3, 3), strides=2, activation="relu", padding="same")(e3)
-    x = layers.Conv2DTranspose(n2, (5, 5), strides=2, activation="relu", padding="same")(x)
-    x = layers.Conv2DTranspose(n1, (7, 7), strides=2, activation="relu", padding="same")(x)
-    x = layers.Conv2D(3, (3, 3), activation="sigmoid", padding="same")(x)
-
-    # Autoencoder
-    encoder = Model(input, e3)
-    decoder = Model(e3, x)
-    autoencoder = Model(input, x)
-    autoencoder.compile(optimizer="adam", loss='mean_squared_error')
-    autoencoder.summary()
+    model = Autoencoder().to(device)
 
     if LoadModel == 0:
-        xtrain = LoadImagesFromFolder(trainfolder)
-        xtrain = xtrain / 255
-        autoencoder.fit(xtrain, xtrain, epochs=epochs, batch_size=batch_size,shuffle=True)
-        autoencoder.save('autoencodertemp.mdl')
-        encoder.save('encoder.mdl')
-        decoder.save('decoder.mdl')
+        model.train()
+        # Load images from folder and preprocess
+        transform = transforms.Compose([
+            transforms.Resize((w, h)),
+            transforms.ToTensor()
+        ])
+        # Assuming CustomImageDataset is a function that loads images as a tensor
+        dataset = CustomImageDataset(trainfolder, transform=transform)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        sheduler = optim.lr_scheduler.StepLR(optimizer, step_size=250, gamma=0.1)
+
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for data in dataloader:
+                inputs = data
+                inputs = inputs.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, inputs)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+            print(f"Epoch {epoch+1}, Loss: {running_loss / len(dataloader)}")
+
+        torch.save(model.state_dict(), f'model/{model_name}.pth')
     else:
-        autoencoder = keras.models.load_model('autoencodertemp.mdl')
-        encoder = keras.models.load_model('encoder.mdl')
-        decoder = keras.models.load_model('decoder.mdl')
-    return encoder,decoder
+        model.load_state_dict(torch.load(f'model/{model_name}.pth'))
+        model.eval()
+
+    return model.encoder, model.decoder
+
 
 #Compresses input layer by multi-alphabet arithmetic coding using memoryless source model
 def EntropyEncoder (filename,enclayers,size_z,size_h,size_w):
@@ -186,17 +259,34 @@ def JPEGRDSingleImage(X,TargetBPP,i):
     image.save(JPEGfilename, "JPEG", quality=realQ)
     return realQ, realbpp, realpsnr
 
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
 # Main function
 if __name__ == '__main__':
-    #Load test images
-    xtest = LoadImagesFromFolder(testfolder)
-    xtest = xtest / 255
+    set_random_seed(42)
+
+    transform = transforms.Compose([
+        transforms.Resize((w, h)),
+        transforms.ToTensor()
+    ])
+    test_dataset = CustomImageDataset(testfolder, transform=transform)
+    test_dataloader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=False)
+
+    for images in test_dataloader:
+        xtest = images.to(device)
+        break
 
     #Train the model
     encoder, decoder = ImageCodecModel(trainfolder)
 
     #Run the model for first NumImagesToShow images from the test set
-    encoded_layers = encoder.predict(xtest, batch_size=NumImagesToShow)
+    encoded_layers = encoder(xtest).detach().cpu().numpy()
     max_encoded_layers = numpy.zeros(NumImagesToShow, numpy.float16, 'C')
 
     #normalization the layer to interval [0,1)
@@ -205,30 +295,33 @@ if __name__ == '__main__':
         encoded_layers[i] = encoded_layers[i] / max_encoded_layers[i]
 
     #Quantization of layer to b bits
-    encoded_layers1 = numpy.clip(encoded_layers, 0, 0.9999999)
-    encoded_layers1 = K.cast(encoded_layers1*pow(2, b), "int32")
+    encoded_layers1 = (torch.clip(torch.tensor(encoded_layers), 0, 0.9999999) * pow(2, b)).to(torch.int32).numpy()
 
     #Encoding and decoding of each quantized layer by arithmetic coding
     bpp = numpy.zeros(NumImagesToShow, numpy.float16, 'C')
-    declayers = numpy.zeros((NumImagesToShow,16, 16, 16), numpy.uint8, 'C')
+    declayers = numpy.zeros((NumImagesToShow, n3, 16, 16), numpy.uint8, 'C')
     for i in range(NumImagesToShow):
         binfilename = 'image%i.bin' % i
-        EntropyEncoder(binfilename, encoded_layers1[i], 16, 16, 16)
+        EntropyEncoder(binfilename, encoded_layers1[i], n3, 16, 16)
         bytesize = os.path.getsize(binfilename)
         bpp[i] = bytesize * 8 / (w * h)
-        declayers[i] = EntropyDecoder(binfilename,  16, 16, 16)
+        declayers[i] = EntropyDecoder(binfilename,  n3, 16, 16)
 
     #Dequantization and denormalization of each layer
     print(bpp)
     shift = 1.0/pow(2, b+1)
-    declayers = K.cast(declayers, "float32") / pow(2, b)
+    declayers = torch.tensor(declayers, dtype=torch.float32) / pow(2, b)
     declayers = declayers + shift
-    encoded_layers_quantized = numpy.zeros((NumImagesToShow, 16, 16, 16), numpy.double, 'C')
+    encoded_layers_quantized = numpy.zeros((NumImagesToShow, n3, 16, 16), dtype=np.float32)
     for i in range(NumImagesToShow):
-        encoded_layers_quantized[i] = K.cast(declayers[i]*max_encoded_layers[i], "float32")
-        encoded_layers[i] = K.cast(encoded_layers[i] * max_encoded_layers[i], "float32")
-    decoded_imgs = decoder.predict(encoded_layers, batch_size=NumImagesToShow)
-    decoded_imgsQ = decoder.predict(encoded_layers_quantized, batch_size=NumImagesToShow)
+        encoded_layers_quantized[i] = declayers[i] * max_encoded_layers[i]
+        encoded_layers[i] = encoded_layers[i] * max_encoded_layers[i]
+    
+    encoded_layers_tensor = torch.tensor(encoded_layers, dtype=torch.float32).to(device)
+    encoded_layers_quantized_tensor = torch.tensor(encoded_layers_quantized, dtype=torch.float32).to(device)
+
+    decoded_imgs = decoder(encoded_layers_tensor)
+    decoded_imgsQ = decoder(encoded_layers_quantized_tensor)
 
     #Shows NumImagesToShow images from the test set
     #For each image the following results are presented
@@ -236,6 +329,11 @@ if __name__ == '__main__':
     #Image, represented by the model (without quantization)
     #Image, represented by the model with quantization and compression of the layers samples
     #Corresponding JPEG image at the same compression level
+    
+    xtest = xtest.detach().cpu().numpy().transpose((0, 2, 3, 1))
+    decoded_imgs = decoded_imgs.detach().cpu().numpy().transpose((0, 2, 3, 1))
+    decoded_imgsQ = decoded_imgsQ.detach().cpu().numpy().transpose((0, 2, 3, 1))
+    
     for i in range(NumImagesToShow):
         title = ''
         plt.subplot(4, NumImagesToShow, i + 1).set_title(title, fontsize=10)
@@ -261,4 +359,5 @@ if __name__ == '__main__':
         plt.subplot(4, NumImagesToShow, 3*NumImagesToShow + i + 1).set_title(title, fontsize=10)
         plt.imshow(JPEGimage, interpolation='nearest')
         plt.axis(False)
+    plt.savefig(f'result_{model_name}.png')
     plt.show()
